@@ -51,6 +51,7 @@ function layerEntry(dir: string): string | undefined {
 
 let current: EditionStatus = { edition: "oss", features: [] };
 let workspaceAccessFactory: ((options: WorkspaceAccessOptions) => WorkspaceAccess) | undefined;
+let oidcAccessFactory: ((options: WorkspaceAccessOptions) => WorkspaceAccess) | undefined;
 
 export interface WorkspaceAccessOptions {
   sessions: SessionRegistry;
@@ -68,6 +69,22 @@ export interface WorkspaceAccess {
   revalidate(): Promise<void>;
 }
 
+export type OidcSsoConfiguration = {
+  issuer: URL;
+  clientId: string;
+  clientSecret: string;
+  tenant: URL;
+  adminGroups: readonly string[];
+  oidcMembership: boolean;
+};
+
+function httpsOrigin(raw: string | undefined): URL {
+  if (!raw || raw !== raw.trim()) throw new Error("missing origin");
+  const url = new URL(raw);
+  if (url.protocol !== "https:" || (raw !== url.origin && raw !== `${url.origin}/`)) throw new Error("invalid origin");
+  return url;
+}
+
 export function hostedWorkspaceConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.OMB_ADMIN_URL !== undefined || env.OMB_ADMIN_WORKSPACE !== undefined || env.OMB_ADMIN_MEMBERSHIP !== undefined;
 }
@@ -75,27 +92,62 @@ export function hostedWorkspaceConfigured(env: NodeJS.ProcessEnv = process.env):
 /** A partial setting is never standalone. */
 export function hostedWorkspaceConfiguration(env: NodeJS.ProcessEnv = process.env): { admin: URL; tenant: URL; workspace: string; portalMembership: boolean } | null {
   try {
-    const origin = (raw: string | undefined) => {
-      if (!raw || raw !== raw.trim()) throw new Error("missing origin");
-      const url = new URL(raw);
-      if (url.protocol !== "https:" || (raw !== url.origin && raw !== `${url.origin}/`)) throw new Error("invalid origin");
-      return url;
-    };
     if (!/^[a-z][a-z0-9-]{1,30}$/.test(env.OMB_ADMIN_WORKSPACE ?? "")) return null;
     if (env.OMB_ADMIN_MEMBERSHIP !== undefined && !["local", "portal"].includes(env.OMB_ADMIN_MEMBERSHIP)) return null;
-    return { admin: origin(env.OMB_ADMIN_URL), tenant: origin(env.OMB_PUBLIC_URL), workspace: env.OMB_ADMIN_WORKSPACE!, portalMembership: env.OMB_ADMIN_MEMBERSHIP === "portal" };
+    return { admin: httpsOrigin(env.OMB_ADMIN_URL), tenant: httpsOrigin(env.OMB_PUBLIC_URL), workspace: env.OMB_ADMIN_WORKSPACE!, portalMembership: env.OMB_ADMIN_MEMBERSHIP === "portal" };
   } catch { return null; }
 }
 
-/** A hosted workspace never issues pairing codes or email sign-in: people come in through the portal. */
+/** Any OMB_OIDC_* (or incomplete OIDC) opts the server into exclusive remote SSO; never a silent email/QR fallback. */
+export function oidcSsoConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.OMB_OIDC_ISSUER !== undefined || env.OMB_OIDC_CLIENT_ID !== undefined
+    || env.OMB_OIDC_CLIENT_SECRET !== undefined || env.OMB_OIDC_ADMIN_GROUPS !== undefined
+    || env.OMB_OIDC_MEMBERSHIP !== undefined;
+}
+
+/** Complete valid OIDC SSO configuration, or null when incomplete/invalid. Mutually exclusive with hosted portal. */
+export function oidcSsoConfiguration(env: NodeJS.ProcessEnv = process.env): OidcSsoConfiguration | null {
+  try {
+    if (hostedWorkspaceConfigured(env)) return null;
+    if (env.OMB_OIDC_MEMBERSHIP !== undefined && !["local", "oidc"].includes(env.OMB_OIDC_MEMBERSHIP)) return null;
+    const issuer = httpsOrigin(env.OMB_OIDC_ISSUER);
+    const clientId = env.OMB_OIDC_CLIENT_ID?.trim() ?? "";
+    const clientSecret = env.OMB_OIDC_CLIENT_SECRET ?? "";
+    if (!clientId || clientId.length > 256 || !clientSecret || clientSecret.length > 512) return null;
+    const adminGroups = (env.OMB_OIDC_ADMIN_GROUPS ?? "").split(",").map((value) => value.trim()).filter(Boolean);
+    if (adminGroups.some((group) => group.length > 128)) return null;
+    return {
+      issuer,
+      clientId,
+      clientSecret,
+      tenant: httpsOrigin(env.OMB_PUBLIC_URL),
+      adminGroups,
+      oidcMembership: env.OMB_OIDC_MEMBERSHIP === "oidc",
+    };
+  } catch { return null; }
+}
+
+/** Hosted portal and OIDC SSO both refuse pairing/email; they must not be configured together. */
 export function workspaceMembership(env: NodeJS.ProcessEnv = process.env):
-  { authority: "local" | "portal"; pairingCodes: boolean; peopleUrl?: string } {
+  { authority: "local" | "portal" | "oidc"; pairingCodes: boolean; remoteSignIn: "pairing" | "portal" | "oidc"; peopleUrl?: string } {
+  const pairingCodes = !hostedWorkspaceConfigured(env) && !oidcSsoConfigured(env);
   const hosted = hostedWorkspaceConfiguration(env);
-  const pairingCodes = !hostedWorkspaceConfigured(env);
-  if (!hosted?.portalMembership) return { authority: "local", pairingCodes };
-  const people = new URL("/people", hosted.admin);
-  people.search = new URLSearchParams({ workspace: hosted.workspace }).toString();
-  return { authority: "portal", pairingCodes, peopleUrl: people.href };
+  if (hostedWorkspaceConfigured(env)) {
+    if (hosted?.portalMembership) {
+      const people = new URL("/people", hosted.admin);
+      people.search = new URLSearchParams({ workspace: hosted.workspace }).toString();
+      return { authority: "portal", pairingCodes, remoteSignIn: "portal", peopleUrl: people.href };
+    }
+    return { authority: "local", pairingCodes, remoteSignIn: "portal" };
+  }
+  if (oidcSsoConfigured(env)) {
+    return {
+      authority: oidcSsoConfiguration(env)?.oidcMembership ? "oidc" : "local",
+      pairingCodes,
+      remoteSignIn: "oidc",
+    };
+  }
+  return { authority: "local", pairingCodes, remoteSignIn: "pairing" };
 }
 
 /** Only on a dedicated, portal-managed server; never an HTTP setting or a desktop grant. */
@@ -106,8 +158,14 @@ export function sharedWorkspaceFullAccessConfigured(env: NodeJS.ProcessEnv = pro
 
 /** A configured server without this hook must refuse hosted access, never fall back to email or QR credentials. */
 export function createWorkspaceAccess(options: Omit<WorkspaceAccessOptions, "entitled">): WorkspaceAccess | null {
-  if (!hostedWorkspaceConfigured(options.env)) return null;
+  if (!hostedWorkspaceConfigured(options.env) || oidcSsoConfigured(options.env)) return null;
   return workspaceAccessFactory?.({ ...options, entitled: () => entitled("admin") }) ?? null;
+}
+
+/** A configured server without this hook must refuse remote SSO, never fall back to email or QR credentials. */
+export function createOidcAccess(options: Omit<WorkspaceAccessOptions, "entitled">): WorkspaceAccess | null {
+  if (!oidcSsoConfigured(options.env) || hostedWorkspaceConfigured(options.env)) return null;
+  return oidcAccessFactory?.({ ...options, entitled: () => entitled("sso") }) ?? null;
 }
 
 function oss(notice?: string): EditionStatus {
@@ -120,6 +178,7 @@ export async function loadEnterpriseLayer(
   options: { dir?: string; licenseKey?: string; env?: NodeJS.ProcessEnv; serverRoot?: string } = {},
 ): Promise<EditionStatus> {
   workspaceAccessFactory = undefined;
+  oidcAccessFactory = undefined;
   const dirs = options.dir ? [options.dir] : enterpriseLayerDirs(options.env, options.serverRoot);
   const licenseKey = options.licenseKey ?? process.env.OMB_LICENSE_KEY;
   const entry = dirs.map(layerEntry).find((candidate) => candidate !== undefined);
@@ -132,6 +191,8 @@ export async function loadEnterpriseLayer(
     const loaded: unknown = await import(pathToFileURL(entry).href);
     const access: unknown = Reflect.get(Object(loaded), "createWorkspaceAccess");
     if (typeof access === "function") workspaceAccessFactory = access as (options: WorkspaceAccessOptions) => WorkspaceAccess;
+    const oidc: unknown = Reflect.get(Object(loaded), "createOidcAccess");
+    if (typeof oidc === "function") oidcAccessFactory = oidc as (options: WorkspaceAccessOptions) => WorkspaceAccess;
     const register: unknown = Reflect.get(Object(loaded), "register");
     if (typeof register !== "function") throw new Error(`${entry} does not export register()`);
     if (!licenseKey) return oss("enterprise layer present but OMB_LICENSE_KEY is not set");

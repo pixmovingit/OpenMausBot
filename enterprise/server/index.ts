@@ -2,6 +2,7 @@
 // becomes entitlements, or a thrown message tells the operator what to fix.
 import { verifyLicenseKey } from "./license.ts";
 export { createWorkspaceAccess } from "./workspace-access.ts";
+export { createOidcAccess } from "./oidc-access.ts";
 
 export interface RegisteredLayer {
   customer: string;

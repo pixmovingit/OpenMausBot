@@ -52,7 +52,7 @@ must not silently fall back to standalone email or pairing credentials.
 | id | grants | status |
 |---|---|---|
 | `whitelabel` | product name, tagline, accent colour, logo, favicon and support link from `brand.json` (below) | shipped |
-| `sso` | sign-in through a company identity provider | planned: nothing checks it yet |
+| `sso` | sign-in through a company OIDC identity provider on a self-hosted home | shipped |
 | `admin` | Settings → Installations and the optional hosted workspace sign-in adapter | shipped |
 | `budgets` | one monthly spend limit for the whole workspace, refusing new turns at the cap, with a warning percentage and admin notices (not per bot or per section) | shipped |
 | `billing` | sell prices per model: a billable column in Usage → History and its CSV, and per-model prices that replace list prices in cost estimates | shipped |
@@ -97,6 +97,27 @@ required. The default keeps the local sign-in allow-list as an additional,
 narrowing check. Operators may explicitly delegate membership for verified
 portal sessions with `OMB_ADMIN_MEMBERSHIP=portal`; this never exempts ordinary
 email or pairing sessions. See the [protocol and isolated verification recipe](../docs/verification/hosted-workspaces.md).
+
+## OIDC SSO on a self-hosted home (`sso`)
+
+The home itself is the OpenID Connect relying party. Operators point it at
+their existing IdP (Okta, Azure AD, Keycloak, Authentik, …) with:
+
+| Variable | Meaning |
+| --- | --- |
+| `OMB_OIDC_ISSUER` | HTTPS issuer origin (`/.well-known/openid-configuration`) |
+| `OMB_OIDC_CLIENT_ID` | confidential client id |
+| `OMB_OIDC_CLIENT_SECRET` | client secret |
+| `OMB_PUBLIC_URL` | exact HTTPS tenant origin; redirect is `{origin}/api/auth/oidc/callback` |
+| `OMB_OIDC_ADMIN_GROUPS` | optional comma-separated `groups`/`roles` values that receive `admin` |
+| `OMB_OIDC_MEMBERSHIP` | `local` (default: still narrow with Settings → People) or `oidc` |
+
+A valid `sso` entitlement is required. Remote access then signs in only
+through the IdP: pairing codes and email OTP are refused. Unproxied
+loopback without a session is service trust (recovery: `OMB_LOOPBACK_TRUST=owner`).
+Do not set `OMB_ADMIN_*` on the same server; the two sign-in authorities are
+mutually exclusive and both fail closed together. See
+[OIDC SSO verification](../docs/verification/oidc-sso.md).
 
 ## White-label (`whitelabel`)
 

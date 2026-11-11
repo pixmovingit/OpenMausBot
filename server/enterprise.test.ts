@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { createWorkspaceAccess, describeEdition, editionForMembers, editionStatus, enterpriseLayerDirs, entitled, hostedWorkspaceConfiguration, hostedWorkspaceConfigured, licenseWarning, sharedWorkspaceFullAccessConfigured, loadEnterpriseLayer } from "./enterprise.ts";
+import { createOidcAccess, createWorkspaceAccess, describeEdition, editionForMembers, editionStatus, enterpriseLayerDirs, entitled, hostedWorkspaceConfiguration, hostedWorkspaceConfigured, licenseWarning, oidcSsoConfiguration, oidcSsoConfigured, sharedWorkspaceFullAccessConfigured, loadEnterpriseLayer, workspaceMembership } from "./enterprise.ts";
 import { SessionRegistry } from "./sessions.ts";
 
 const dirs: string[] = [];
@@ -45,6 +45,27 @@ describe("enterprise hook point", () => {
     expect(createWorkspaceAccess({ sessions, cookieName: "session", closeSessionStreams() {}, env: {} })).toBeNull();
     expect(createWorkspaceAccess({ sessions, cookieName: "session", closeSessionStreams() {}, env: { OMB_ADMIN_WORKSPACE: "acme" } })).toBeNull();
   });
+
+  it("opts into OIDC SSO from any OMB_OIDC_* and refuses a bridge when incomplete, conflicting, or without the layer", () => {
+    expect(oidcSsoConfigured({})).toBe(false);
+    expect(oidcSsoConfigured({ OMB_OIDC_ISSUER: "" })).toBe(true);
+    const complete = {
+      OMB_OIDC_ISSUER: "https://idp.example.test",
+      OMB_OIDC_CLIENT_ID: "client",
+      OMB_OIDC_CLIENT_SECRET: "secret",
+      OMB_PUBLIC_URL: "https://home.example.test",
+    };
+    expect(oidcSsoConfiguration(complete)).toMatchObject({ clientId: "client", oidcMembership: false });
+    expect(oidcSsoConfiguration({ ...complete, OMB_OIDC_MEMBERSHIP: "oidc" })?.oidcMembership).toBe(true);
+    expect(oidcSsoConfiguration({ ...complete, OMB_OIDC_ISSUER: "http://idp.example.test" })).toBeNull();
+    expect(oidcSsoConfiguration({ ...complete, OMB_ADMIN_URL: "https://admin.example.test" })).toBeNull();
+    expect(workspaceMembership(complete)).toMatchObject({ pairingCodes: false, remoteSignIn: "oidc", authority: "local" });
+    expect(workspaceMembership({ ...complete, OMB_OIDC_MEMBERSHIP: "oidc" })).toMatchObject({ authority: "oidc", remoteSignIn: "oidc" });
+    const dir = fakeLayer("export const fixture = true;");
+    const sessions = new SessionRegistry({ file: join(dir, "sessions.json") });
+    expect(createOidcAccess({ sessions, cookieName: "session", closeSessionStreams() {}, env: complete })).toBeNull();
+    expect(createWorkspaceAccess({ sessions, cookieName: "session", closeSessionStreams() {}, env: { OMB_ADMIN_WORKSPACE: "acme", ...complete } })).toBeNull();
+  });
   it("requires complete valid hosted configuration before opting into portal membership", () => {
     const env = { OMB_ADMIN_URL: "https://admin.example.test", OMB_ADMIN_WORKSPACE: "acme", OMB_PUBLIC_URL: "https://acme.example.test" };
     expect(hostedWorkspaceConfiguration(env)?.portalMembership).toBe(false);
@@ -69,6 +90,21 @@ describe("enterprise hook point", () => {
     await loadEnterpriseLayer({ dir, licenseKey: "fixture" });
     const sessions = new SessionRegistry({ file: join(dir, "sessions.json") });
     const bridge = createWorkspaceAccess({ sessions, cookieName: "session", closeSessionStreams() {}, env: { OMB_ADMIN_WORKSPACE: "acme" } });
+    expect(await bridge!.handlePublic(null as never, null as never, null as never)).toBe(true);
+    await loadEnterpriseLayer({ dir: join(dir, "absent") });
+    expect(await bridge!.handlePublic(null as never, null as never, null as never)).toBe(false);
+  });
+
+  it("passes the live sso entitlement to the optional OIDC bridge", async () => {
+    const dir = fakeLayer(`
+      export function register() { return { customer: 'Fixture', features: ['sso'], expiresAt: null }; }
+      export function createOidcAccess(options) {
+        return { handlePublic: async () => options.entitled(), authorize: async () => null, revalidate: async () => {} };
+      }
+    `);
+    await loadEnterpriseLayer({ dir, licenseKey: "fixture" });
+    const sessions = new SessionRegistry({ file: join(dir, "sessions.json") });
+    const bridge = createOidcAccess({ sessions, cookieName: "session", closeSessionStreams() {}, env: { OMB_OIDC_ISSUER: "https://idp.example.test" } });
     expect(await bridge!.handlePublic(null as never, null as never, null as never)).toBe(true);
     await loadEnterpriseLayer({ dir: join(dir, "absent") });
     expect(await bridge!.handlePublic(null as never, null as never, null as never)).toBe(false);

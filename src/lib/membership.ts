@@ -1,12 +1,15 @@
 export interface Membership {
-  authority: "local" | "portal";
+  authority: "local" | "portal" | "oidc";
   pairingCodes: boolean;
+  remoteSignIn: "pairing" | "portal" | "oidc";
   peopleUrl: string | null;
 }
 
 export function readMembership(config: unknown): Membership {
   const raw = config && typeof config === "object" ? (config as { membership?: unknown }).membership : undefined;
-  const value = raw && typeof raw === "object" ? raw as { authority?: unknown; pairingCodes?: unknown; peopleUrl?: unknown } : {};
+  const value = raw && typeof raw === "object"
+    ? raw as { authority?: unknown; pairingCodes?: unknown; peopleUrl?: unknown; remoteSignIn?: unknown }
+    : {};
   let peopleUrl: string | null = null;
   if (typeof value.peopleUrl === "string") {
     try {
@@ -15,5 +18,9 @@ export function readMembership(config: unknown): Membership {
       peopleUrl = null;
     }
   }
-  return { authority: value.authority === "portal" ? "portal" : "local", pairingCodes: value.pairingCodes !== false, peopleUrl };
+  const authority = value.authority === "portal" || value.authority === "oidc" ? value.authority : "local";
+  const remoteSignIn = value.remoteSignIn === "portal" || value.remoteSignIn === "oidc" || value.remoteSignIn === "pairing"
+    ? value.remoteSignIn
+    : authority === "portal" ? "portal" : authority === "oidc" ? "oidc" : value.pairingCodes === false ? "portal" : "pairing";
+  return { authority, pairingCodes: value.pairingCodes !== false, remoteSignIn, peopleUrl };
 }

@@ -519,7 +519,7 @@ import {
 } from "./turn-dispatch-guard.ts";
 import { createGracefulShutdown } from "./graceful-shutdown.ts";
 import { acquireDataDirLeaseForProcess } from "./data-dir-lease.ts";
-import { createWorkspaceAccess, describeEdition, editionForSettings, editionStatus, entitled, hostedWorkspaceConfiguration, hostedWorkspaceConfigured, licenseWarning, sharedWorkspaceFullAccessConfigured, loadEnterpriseLayer, workspaceMembership, type WorkspaceAccess } from "./enterprise.ts";
+import { createOidcAccess, createWorkspaceAccess, describeEdition, editionForSettings, editionStatus, entitled, hostedWorkspaceConfiguration, hostedWorkspaceConfigured, licenseWarning, oidcSsoConfiguration, oidcSsoConfigured, sharedWorkspaceFullAccessConfigured, loadEnterpriseLayer, workspaceMembership, type WorkspaceAccess } from "./enterprise.ts";
 import { environmentDescriptor, loadEnvironmentId, OWNER_LENDING, serverVersion } from "./environment.ts"; import { dataFormatAtStart } from "./data-format.ts";
 import { WorkspaceBackupMaintenance } from "./workspace-backup-maintenance.ts";
 import { createWorkspaceBackupRoutes, isWorkspaceBackupSessionControl } from "./workspace-backup-http.ts";
@@ -685,7 +685,9 @@ const sessions = new SessionRegistry({
     const membership = signInAllowList();
     return (email) => allowedScopes(email, membership);
   },
-  portalMembership: hostedWorkspaceConfiguration()?.portalMembership === true, recheckMs: 1_000,
+  portalMembership: hostedWorkspaceConfiguration()?.portalMembership === true,
+  oidcMembership: oidcSsoConfiguration()?.oidcMembership === true,
+  recheckMs: 1_000,
 }); onConfigSaved(() => sessions.membershipChanged());
 const deviceLinks = new DeviceLinks(); const sharedComputers = new SharedComputers(id => sessions.isLive(id), new LentComputers(join(DATA_DIR, "lent-computers.json")), deviceLinks, lentCopies); sharedComputers.wokeAt = () => cloudPowerNow()?.sleptUntil() ?? null; let startedFromSleep = false;
 // A Cloud home's secrets come over the launcher's pipe, never this process's environment.
@@ -750,14 +752,16 @@ if (logins.onePasswordToken()) void onePassword.refresh();
 const botLogins = new BotLogins(logins, onePassword, () => store.bots, (value) => heldSecrets.remember(value, "password")); const mcpKeys = createMcpKeys({ store: logins, linked: { fresh: () => botLogins.fresh(), byId: (id) => botLogins.linkedById(id) } });
 const SESSION_COOKIE = sessionCookieName(PORT, ENVIRONMENT_ID);
 const HOSTED_WORKSPACE = hostedWorkspaceConfigured();
+const OIDC_SSO = oidcSsoConfigured();
 let workspaceAccess: WorkspaceAccess | null = null;
+let oidcAccess: WorkspaceAccess | null = null;
 const DESKTOP_MANAGED = process.env.OMB_DESKTOP_PARENT === "1";
 const SHARED_WORKSPACE_FULL_ACCESS = sharedWorkspaceFullAccessConfigured();
 const sharedWorkspaceFullAccessEnabled = () => SHARED_WORKSPACE_FULL_ACCESS && Boolean(workspaceAccess) && entitled("admin");
 const HOSTED_FULL_ACCESS_REFUSAL = "On a shared company workspace Full access comes only from the operator's dedicated policy";
 if (HOSTED_WORKSPACE) setDefaultApprovalMode("ask");
 // On a shared workspace loopback is a service, not the owner: every bot's shell is a loopback caller too.
-const LOOPBACK = resolveLoopbackTrust({ desktopManaged: DESKTOP_MANAGED, hostedWorkspace: HOSTED_WORKSPACE, cloudHome: Boolean(CLOUD_HOME), fromSource: import.meta.url.endsWith(".ts") });
+const LOOPBACK = resolveLoopbackTrust({ desktopManaged: DESKTOP_MANAGED, hostedWorkspace: HOSTED_WORKSPACE, oidcSso: OIDC_SSO, cloudHome: Boolean(CLOUD_HOME), fromSource: import.meta.url.endsWith(".ts") });
 // The CLI's per-launch secret comes on stdin, never an env var: every engine this server starts inherits its environment.
 let cliOwnerToken: string | undefined;
 if (process.env.OMB_CLI_OWNER_STDIN === "1" && LOOPBACK.trust === "service" && process.stdin) {
@@ -12434,8 +12438,12 @@ ROUTES.push(createBrowserViewerRoutes({
     const browser = await browserIntegration(bot.id, bot.browserProfile, undefined, audience);
     return browser ? { botId: bot.id, session: browser.session, spec: browser.spec } : { status: 503, error: "Install the browser first." };
   },
-  authorize: async (req, auth) => !HOSTED_WORKSPACE || auth.kind !== "session" ? null
-    : workspaceAccess ? workspaceAccess.authorize(req, auth) : { status: 503, error: "Workspace sign-in is unavailable." },
+  authorize: async (req, auth) => {
+    if (auth.kind !== "session") return null;
+    if (HOSTED_WORKSPACE) return workspaceAccess ? workspaceAccess.authorize(req, auth) : { status: 503, error: "Workspace sign-in is unavailable." };
+    if (OIDC_SSO) return oidcAccess ? oidcAccess.authorize(req, auth) : { status: 503, error: "Workspace sign-in is unavailable." };
+    return null;
+  },
   current: (botId, session, auth, audience) => {
     const current = store.bot(botId);
     return !!current && current.browser !== false && builtInBrowserEnabled(cfg) && currentBrowserSession(current.id, current.browserProfile, audience) === session
@@ -12583,6 +12591,17 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 503, { error: "Workspace sign-in is unavailable." });
       }
     }
+    // OIDC SSO is exclusive for remote access: never fall back to email or pairing credentials.
+    if (OIDC_SSO) {
+      if (method === "POST" && ["/api/auth/pair", "/api/pair", "/api/auth/pairing", "/api/auth/email/start", "/api/auth/email/verify"].includes(path)) {
+        return json(res, 403, { error: "Sign in through your identity provider." });
+      }
+      if (oidcAccess) {
+        if (await oidcAccess.handlePublic(req, res, url)) return;
+      } else if (path.startsWith("/api/auth/oidc/") || path === "/pair" || (path === "/" && (!isLoopbackHost(req.headers.host) || isProxied(req)))) {
+        return json(res, 503, { error: "Workspace sign-in is unavailable." });
+      }
+    }
     if (method === "POST" && remoteAccessPaths(CLOUD_TEAM !== null).includes(path)) {
       const refusal = managedPolicy.remoteAccessRefusal();
       if (refusal) return json(res, 403, { error: refusal, code: "managed_policy" });
@@ -12599,7 +12618,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Two public routes come first; everything else needs the loopback owner or a paired session with the right scope.
     if (method === "GET" && !path.startsWith("/api/") && !path.startsWith("/.well-known/") && (moveFreeze.screen(path) ? (res.writeHead(302, { location: moveFreeze.screen(path)!, "cache-control": "no-store" }).end(), true) : serveStatic(res, path, STATIC_DIR))) return;
     if (method === "GET" && path === "/.well-known/openmausbot/environment") {
-      return json(res, 200, environmentDescriptor({ environmentId: ENVIRONMENT_ID, ...TEAM_LABEL, desktopManaged: DESKTOP_MANAGED, emailSignIn: !HOSTED_WORKSPACE && !CLOUD_HOME && emailSignIn.enabled(), sharedComputers: lendingEnabled(), cloudHome: Boolean(CLOUD_HOME), cloudTeam: CLOUD_TEAM !== null, ownHome: ownHome.takesMove() }));
+      return json(res, 200, environmentDescriptor({ environmentId: ENVIRONMENT_ID, ...TEAM_LABEL, desktopManaged: DESKTOP_MANAGED, emailSignIn: !HOSTED_WORKSPACE && !OIDC_SSO && !CLOUD_HOME && emailSignIn.enabled(), sharedComputers: lendingEnabled(), cloudHome: Boolean(CLOUD_HOME), cloudTeam: CLOUD_TEAM !== null, ownHome: ownHome.takesMove() }));
     }
     const domainCheck = /^\/\.well-known\/openmausbot\/domain-check\/([a-f0-9]{64})$/.exec(path);
     if (method === "GET" && domainCheck) {
@@ -12687,7 +12706,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (gate.auth?.kind === "session" && gate.auth.via === "cookie") {
       const presented = parseCookies(req.headers.cookie).get(SESSION_COOKIE);
       if (presented) {
-        const secure = HOSTED_WORKSPACE || requestOrigin(req)?.startsWith("https://") === true;
+        const secure = HOSTED_WORKSPACE || OIDC_SSO || requestOrigin(req)?.startsWith("https://") === true;
         res.setHeader("set-cookie", serializeSessionCookie(SESSION_COOKIE, presented, { secure, maxAgeSeconds: cookieMaxAgeSeconds(gate.auth.session) }));
       }
     }
@@ -12705,6 +12724,12 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (HOSTED_WORKSPACE && auth.kind === "session") {
       const failure = workspaceAccess
         ? await workspaceAccess.authorize(req, auth)
+        : { status: 503, error: "Workspace sign-in is unavailable." };
+      if (failure) return json(res, failure.status, { error: failure.error });
+    }
+    if (OIDC_SSO && auth.kind === "session") {
+      const failure = oidcAccess
+        ? await oidcAccess.authorize(req, auth)
         : { status: 503, error: "Workspace sign-in is unavailable." };
       if (failure) return json(res, failure.status, { error: failure.error });
     }
@@ -12848,11 +12873,30 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (method === "GET" && path === "/api/auth/sessions") {
       return json(res, 200, { sessions: sessions.list(), current: auth.kind === "session" ? auth.session.id : null });
     }
+    if (method === "DELETE" && path === "/api/auth/sessions") {
+      const email = String(url.searchParams.get("email") ?? "").trim().toLowerCase();
+      if (!email || !email.includes("@") || email.startsWith("@")) {
+        return json(res, 400, { error: "email query required" });
+      }
+      return json(res, 200, { ok: true, revoked: sessions.revokeEmail(email) });
+    }
     m = path.match(/^\/api\/auth\/sessions\/([\w-]+)$/);
     if (m && method === "DELETE") {
       const revoked = sessions.revoke(m[1]);
       if (auth.kind === "session" && auth.session.id === m[1]) res.setHeader("set-cookie", clearSessionCookie(SESSION_COOKIE));
       return json(res, revoked ? 200 : 404, revoked ? { ok: true } : { error: "no such session" });
+    }
+    if (m && method === "PATCH") {
+      const body = z.object({ scopes: z.tuple([z.literal("client")]) }).strict().safeParse(await readBody(req));
+      if (!body.success) return json(res, 400, { error: "only demotion to client is allowed" });
+      if (auth.kind === "session" && auth.session.id === m[1]) {
+        return json(res, 400, { error: "cannot demote the session you are using" });
+      }
+      const result = sessions.demote(m[1]);
+      if (result === "missing") return json(res, 404, { error: "no such session" });
+      if (result === "foreign") return json(res, 403, { error: "session membership is managed elsewhere" });
+      if (result === "already") return json(res, 200, { ok: true, scopes: ["client"] as const });
+      return json(res, 200, { ok: true, scopes: ["client"] as const });
     }
     // Test-only routes exist only when the launcher sets a high-entropy test key, which production builds never set.
     if (method === "POST" && path === "/api/testing/org-library") {
@@ -15329,11 +15373,18 @@ const pruneDecisionLog = () => {
 pruneDecisionLog();
 setInterval(pruneDecisionLog, 6 * 60 * 60_000).unref();
 workspaceAccess = createWorkspaceAccess({ sessions, cookieName: SESSION_COOKIE, closeSessionStreams });
-// With the bridge's five-second deadline, this bounds stale portal access on quiet streams to fifteen seconds.
+oidcAccess = createOidcAccess({ sessions, cookieName: SESSION_COOKIE, closeSessionStreams });
+// With the bridge's five-second deadline, this bounds stale portal/OIDC access on quiet streams to fifteen seconds.
 const workspaceAccessTimer = workspaceAccess ? setInterval(() => {
   void workspaceAccess!.revalidate().catch((error) => console.warn("workspace access revalidation failed", error));
 }, 10_000) : null;
 workspaceAccessTimer?.unref();
+const oidcAccessTimer = oidcAccess ? setInterval(() => {
+  void oidcAccess!.revalidate().catch((error) => console.warn("OIDC access revalidation failed", error));
+}, 10_000) : null;
+oidcAccessTimer?.unref();
+if (HOSTED_WORKSPACE && OIDC_SSO) console.warn("hosted portal and OIDC SSO are both configured; remote sign-in stays unavailable until one is removed");
+else if (OIDC_SSO && !oidcAccess) console.warn("OIDC SSO is configured but unavailable (license must include sso, and OMB_OIDC_* must be complete)");
 console.log(describeBrand(loadBrand()));
 
 // Before any row below settles: an interrupted dispatch's words come back with a review notice, never to a model a second time.

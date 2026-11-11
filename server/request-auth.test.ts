@@ -168,7 +168,7 @@ describe("scopes", () => {
       ["GET", "/api/bots/x/memory"], ["PUT", "/api/bots/x/memory"], ["PUT", "/api/section-context"], ["GET", "/api/threads/t/events"],
       ["GET", "/api/mcp/servers"], ["POST", "/api/mcp/servers"], ["GET", "/api/bots/x/mcp-servers"], ["POST", "/api/connectors/slack/authorize"],
       ["POST", "/api/bots/x/slack-management"], ["GET", "/api/bots/x/slack-management/extra"],
-      ["PUT", "/api/config"], ["POST", "/api/auth/pairing"], ["GET", "/api/auth/sessions"], ["DELETE", "/api/auth/sessions/abc"],
+      ["PUT", "/api/config"], ["POST", "/api/auth/pairing"], ["GET", "/api/auth/sessions"], ["DELETE", "/api/auth/sessions"], ["DELETE", "/api/auth/sessions/abc"], ["PATCH", "/api/auth/sessions/abc"],
       ["POST", "/api/live/session"], ["POST", "/api/live/call/end"], ["GET", "/api/live/call"], ["PATCH", "/api/live/settings"],
       ["POST", "/api/live/device-revoked"],
       ["POST", "/api/auth/pair"],
@@ -742,15 +742,17 @@ describe("loopback trust: owner on one person's machine, service on a shared wor
   });
 
   it("defaults to service on a hosted workspace, owner elsewhere, and lets the operator choose", () => {
-    const pick = (env: NodeJS.ProcessEnv, flags: { desktopManaged?: boolean; hostedWorkspace?: boolean } = {}) =>
+    const pick = (env: NodeJS.ProcessEnv, flags: { desktopManaged?: boolean; hostedWorkspace?: boolean; oidcSso?: boolean } = {}) =>
       resolveLoopbackTrust({ env, desktopManaged: false, hostedWorkspace: false, ...flags });
     expect(pick({})).toEqual({ trust: "owner", reason: "self-hosted default", localBrowsers: false });
     expect(pick({}, { hostedWorkspace: true })).toEqual({ trust: "service", reason: "hosted workspace", localBrowsers: false });
+    expect(pick({}, { oidcSso: true })).toEqual({ trust: "service", reason: "OIDC SSO", localBrowsers: false });
     expect(pick({ OMB_LOOPBACK_TRUST: "service" })).toEqual({ trust: "service", reason: "OMB_LOOPBACK_TRUST", localBrowsers: false });
     expect(pick({ OMB_LOOPBACK_TRUST: " Service " }).trust).toBe("service");
     const forced = pick({ OMB_LOOPBACK_TRUST: "owner" }, { hostedWorkspace: true });
     expect(forced.trust).toBe("owner");
     expect(forced.warning).toMatch(/shared workspace/);
+    expect(pick({ OMB_LOOPBACK_TRUST: "owner" }, { oidcSso: true }).warning).toMatch(/shared workspace/);
     const typo = pick({ OMB_LOOPBACK_TRUST: "own3r\n" });
     expect(typo.trust).toBe("service");
     expect(typo.warning).toMatch(/not owner or service/);

@@ -1,6 +1,6 @@
 // Security: the invite link is convenience, not a second door; the one-time code still goes to the address itself.
 import { useCallback, useEffect, useState } from "react";
-import { Check, Copy, ExternalLink, Link2, Loader2, Plus, RefreshCw, Users, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Copy, ExternalLink, Link2, Loader2, Plus, RefreshCw, Users, X } from "lucide-react";
 import { api } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { t } from "@/lib/i18n";
@@ -15,6 +15,13 @@ import { Select } from "./Select";
 
 export type Role = "admin" | "member";
 
+export interface DeviceSession {
+  id: string;
+  label: string;
+  scopes: string[];
+  lastSeenAt: number;
+  email?: string;
+}
 
 export interface Person {
   entry: string;
@@ -22,6 +29,7 @@ export interface Person {
   isDomain: boolean;
   lastSeenAt: number | null;
   devices: number;
+  sessions: DeviceSession[];
   turns: number;
   costUsd: number | null;
   estimated?: boolean;
@@ -32,25 +40,46 @@ export function inviteLink(base: string, entry: string): string {
   return entry.startsWith("@") ? `${origin}/pair` : `${origin}/pair?email=${encodeURIComponent(entry)}`;
 }
 
+function asDevices(sessions: Array<{ id?: string; label?: string; scopes?: string[]; email?: string; lastSeenAt: number }>): DeviceSession[] {
+  return sessions.flatMap((session) => {
+    if (typeof session.id !== "string" || !session.id) return [];
+    return [{
+      id: session.id,
+      label: typeof session.label === "string" && session.label.trim() ? session.label : session.id,
+      scopes: Array.isArray(session.scopes) ? session.scopes.map(String) : [],
+      lastSeenAt: session.lastSeenAt,
+      ...(typeof session.email === "string" && session.email.trim() ? { email: session.email.trim().toLowerCase() } : {}),
+    }];
+  });
+}
+
+export function orphanDevices(sessions: DeviceSession[]): DeviceSession[] {
+  return sessions
+    .filter((session) => !session.email)
+    .sort((a, b) => b.lastSeenAt - a.lastSeenAt || a.label.localeCompare(b.label));
+}
+
 export function mergePeople(
   lists: SignInLists,
-  sessions: Array<{ email?: string; lastSeenAt: number }>,
+  sessions: Array<{ id?: string; label?: string; scopes?: string[]; email?: string; lastSeenAt: number }>,
   usage: Array<{ key: string; turns: number; costUsd: number | null; estimatedUsd?: number | null }>,
 ): Person[] {
   const people: Person[] = [];
   const seen = new Set<string>();
+  const devices = asDevices(sessions);
   const add = (entry: string, role: Role) => {
     const key = entry.trim().toLowerCase();
     if (!key || seen.has(key)) return;
     seen.add(key);
-    const devices = sessions.filter((session) => session.email?.toLowerCase() === key);
+    const matched = key.startsWith("@") ? [] : devices.filter((session) => session.email === key);
     const month = usage.find((group) => group.key === `user:${key}`);
     people.push({
       entry: key,
       role,
       isDomain: key.startsWith("@"),
-      lastSeenAt: devices.length ? Math.max(...devices.map((session) => session.lastSeenAt)) : null,
-      devices: devices.length,
+      lastSeenAt: matched.length ? Math.max(...matched.map((session) => session.lastSeenAt)) : null,
+      devices: matched.length,
+      sessions: matched,
       turns: month?.turns ?? 0,
       costUsd: month?.costUsd ?? null,
       ...(hasFiniteCost(month?.estimatedUsd) && month.estimatedUsd > 0 ? { estimated: true } : {}),
@@ -62,22 +91,24 @@ export function mergePeople(
 }
 
 export function peopleFromSessions(
-  sessions: Array<{ email?: string; lastSeenAt: number; scopes?: string[] }>,
+  sessions: Array<{ id?: string; label?: string; email?: string; lastSeenAt: number; scopes?: string[] }>,
   usage: Array<{ key: string; turns: number; costUsd: number | null }>,
 ): Person[] {
-  const byEmail = new Map<string, Array<{ lastSeenAt: number; scopes?: string[] }>>();
-  for (const session of sessions) {
-    const email = session.email?.trim().toLowerCase();
-    if (email) byEmail.set(email, [...(byEmail.get(email) ?? []), session]);
+  const devices = asDevices(sessions);
+  const byEmail = new Map<string, DeviceSession[]>();
+  for (const session of devices) {
+    if (!session.email) continue;
+    byEmail.set(session.email, [...(byEmail.get(session.email) ?? []), session]);
   }
-  return [...byEmail.entries()].map(([entry, devices]) => {
+  return [...byEmail.entries()].map(([entry, matched]) => {
     const month = usage.find((group) => group.key === `user:${entry}`);
     return {
       entry,
-      role: devices.some((device) => device.scopes?.includes("admin")) ? "admin" : "member",
+      role: matched.some((device) => device.scopes.includes("admin")) ? "admin" : "member",
       isDomain: false,
-      lastSeenAt: Math.max(...devices.map((device) => device.lastSeenAt)),
-      devices: devices.length,
+      lastSeenAt: Math.max(...matched.map((device) => device.lastSeenAt)),
+      devices: matched.length,
+      sessions: matched,
       turns: month?.turns ?? 0,
       costUsd: month?.costUsd ?? null,
     } satisfies Person;
@@ -90,14 +121,88 @@ export function lastSeenLabel(lastSeenAt: number | null, now = Date.now()): stri
   return new Date(lastSeenAt).toISOString().slice(0, 10);
 }
 
-export function PeopleTable({ people, busy, onRole, onRemove, onLink, readOnly = false }: {
+function deviceRole(session: DeviceSession): Role {
+  return session.scopes.includes("admin") ? "admin" : "member";
+}
+
+function DeviceRows({
+  sessions,
+  busy,
+  currentId,
+  onSignOut,
+  onDemote,
+  onPromoteBlocked,
+}: {
+  sessions: DeviceSession[];
+  busy: boolean;
+  currentId: string | null;
+  onSignOut?: (id: string) => void;
+  onDemote?: (id: string) => void;
+  onPromoteBlocked?: () => void;
+}) {
+  if (!sessions.length) return null;
+  return (
+    <ul className="mt-2 space-y-1 border-l border-hairline/40 pl-3 text-[12px]">
+      {sessions.map((device) => {
+        const role = deviceRole(device);
+        return (
+          <li key={device.id} className="flex flex-wrap items-center justify-between gap-2 py-1 text-ink-secondary">
+            <span className="min-w-0 text-ink">
+              {device.label}
+              <span className="text-ink-secondary">
+                {" · "}
+                {role === "admin" ? t("people.roleAdmin") : t("people.roleMember")}
+                {" · "}
+                {lastSeenLabel(device.lastSeenAt)}
+                {device.id === currentId ? ` · ${t("people.thisDevice")}` : ""}
+              </span>
+            </span>
+            <span className="flex items-center gap-2">
+              {onDemote && role === "admin" && device.id !== currentId && (
+                <button type="button" disabled={busy} onClick={() => onDemote(device.id)} className="text-ink-secondary hover:text-ink disabled:opacity-50">
+                  {t("people.makeMember")}
+                </button>
+              )}
+              {onPromoteBlocked && role === "member" && (
+                <button type="button" disabled={busy} onClick={onPromoteBlocked} className="text-ink-secondary hover:text-ink disabled:opacity-50">
+                  {t("people.makeAdmin")}
+                </button>
+              )}
+              {onSignOut && device.id !== currentId && (
+                <button type="button" disabled={busy} onClick={() => onSignOut(device.id)} className="text-danger hover:underline disabled:opacity-50">
+                  {t("people.signOutDevice")}
+                </button>
+              )}
+            </span>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+export function PeopleTable({
+  people,
+  busy,
+  onRole,
+  onRemove,
+  onLink,
+  onSignOutAll,
+  onSignOutDevice,
+  currentId = null,
+  readOnly = false,
+}: {
   people: Person[];
   busy: boolean;
   onRole: (person: Person, role: Role) => void;
   onRemove: (person: Person) => void;
   onLink: (person: Person) => void;
+  onSignOutAll?: (person: Person) => void;
+  onSignOutDevice?: (id: string) => void;
+  currentId?: string | null;
   readOnly?: boolean;
 }) {
+  const [open, setOpen] = useState<Record<string, boolean>>({});
   if (people.length === 0) return <p className="text-[13px] text-ink-secondary">{t(readOnly ? "people.portal.empty" : "people.empty")}</p>;
   const columns = "grid grid-cols-[1fr_auto_auto_auto_auto] items-center gap-x-4";
   return (
@@ -109,28 +214,90 @@ export function PeopleTable({ people, busy, onRole, onRemove, onLink, readOnly =
         <span className="text-right">{t("people.colMonth")}</span>
         <span />
       </div>
-      {people.map((person) => (
-        <div key={person.entry} className={cn(columns, "border-b border-hairline/20 py-2 text-[13px]")}>
-          <span className="min-w-0">
-            <span className="block truncate text-ink">{person.isDomain ? t("people.everyoneAt", { domain: person.entry.slice(1) }) : person.entry}</span>
-            {person.devices > 0 && <span className="block text-[12px] text-ink-secondary">{t("people.devices", { count: String(person.devices) })}</span>}
-          </span>
-          <span className={cn("rounded-full px-2 py-0.5 text-[11px] font-medium", person.role === "admin" ? "bg-accent/15 text-accent" : "bg-control text-ink-secondary")}>
-            {person.role === "admin" ? t("people.roleAdmin") : t("people.roleMember")}
-          </span>
-          <span className="text-right tabular-nums text-ink-secondary">{person.isDomain ? "—" : lastSeenLabel(person.lastSeenAt)}</span>
-          <span className="text-right tabular-nums text-ink" title={t("people.turns", { turns: String(person.turns) })}>
-            {hasFiniteCost(person.costUsd) ? `${person.estimated ? "~" : ""}${formatUsd(person.costUsd)}` : "—"}
-          </span>
-          {readOnly ? <span /> : <span className="flex items-center justify-end gap-2 text-[12px]">
-            <button type="button" disabled={busy} onClick={() => onLink(person)} aria-label={t("people.link")} title={t("people.link")} className="rounded-md p-1 text-ink-secondary hover:bg-control hover:text-ink disabled:opacity-50"><Link2 size={13} /></button>
-            <button type="button" disabled={busy} onClick={() => onRole(person, person.role === "admin" ? "member" : "admin")} className="text-ink-secondary hover:text-ink disabled:opacity-50">
-              {person.role === "admin" ? t("people.makeMember") : t("people.makeAdmin")}
-            </button>
-            <button type="button" disabled={busy} onClick={() => onRemove(person)} className="text-danger hover:underline disabled:opacity-50">{t("people.remove")}</button>
-          </span>}
-        </div>
-      ))}
+      {people.map((person) => {
+        const expanded = open[person.entry] === true;
+        const canExpand = person.sessions.length > 0;
+        return (
+          <div key={person.entry} className="border-b border-hairline/20 py-2 text-[13px]">
+            <div className={columns}>
+              <span className="min-w-0">
+                <button
+                  type="button"
+                  disabled={!canExpand}
+                  aria-expanded={canExpand ? expanded : undefined}
+                  onClick={() => canExpand && setOpen((state) => ({ ...state, [person.entry]: !expanded }))}
+                  className={cn("flex w-full min-w-0 items-start gap-1 text-left", canExpand ? "cursor-pointer" : "cursor-default")}
+                >
+                  {canExpand ? (expanded ? <ChevronDown size={14} className="mt-0.5 shrink-0 text-ink-secondary" /> : <ChevronRight size={14} className="mt-0.5 shrink-0 text-ink-secondary" />) : <span className="mt-0.5 w-3.5 shrink-0" />}
+                  <span className="min-w-0">
+                    <span className="block truncate text-ink">{person.isDomain ? t("people.everyoneAt", { domain: person.entry.slice(1) }) : person.entry}</span>
+                    {person.devices > 0 && <span className="block text-[12px] text-ink-secondary">{t("people.devices", { count: String(person.devices) })}</span>}
+                  </span>
+                </button>
+              </span>
+              <span className={cn("rounded-full px-2 py-0.5 text-[11px] font-medium", person.role === "admin" ? "bg-accent/15 text-accent" : "bg-control text-ink-secondary")}>
+                {person.role === "admin" ? t("people.roleAdmin") : t("people.roleMember")}
+              </span>
+              <span className="text-right tabular-nums text-ink-secondary">{person.isDomain ? "—" : lastSeenLabel(person.lastSeenAt)}</span>
+              <span className="text-right tabular-nums text-ink" title={t("people.turns", { turns: String(person.turns) })}>
+                {hasFiniteCost(person.costUsd) ? `${person.estimated ? "~" : ""}${formatUsd(person.costUsd)}` : "—"}
+              </span>
+              {readOnly ? <span /> : <span className="flex flex-wrap items-center justify-end gap-2 text-[12px]">
+                {!person.isDomain && onSignOutAll && person.sessions.length > 0 && (
+                  <button type="button" disabled={busy} onClick={() => onSignOutAll(person)} className="text-ink-secondary hover:text-ink disabled:opacity-50">
+                    {t("people.signOutAll")}
+                  </button>
+                )}
+                <button type="button" disabled={busy} onClick={() => onLink(person)} aria-label={t("people.link")} title={t("people.link")} className="rounded-md p-1 text-ink-secondary hover:bg-control hover:text-ink disabled:opacity-50"><Link2 size={13} /></button>
+                <button type="button" disabled={busy} onClick={() => onRole(person, person.role === "admin" ? "member" : "admin")} className="text-ink-secondary hover:text-ink disabled:opacity-50">
+                  {person.role === "admin" ? t("people.makeMember") : t("people.makeAdmin")}
+                </button>
+                <button type="button" disabled={busy} onClick={() => onRemove(person)} className="text-danger hover:underline disabled:opacity-50">{t("people.remove")}</button>
+              </span>}
+            </div>
+            {expanded && (
+              <DeviceRows
+                sessions={person.sessions}
+                busy={busy}
+                currentId={currentId}
+                onSignOut={onSignOutDevice}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export function OrphanDevices({
+  devices,
+  busy,
+  currentId,
+  onSignOut,
+  onDemote,
+  onPromoteBlocked,
+}: {
+  devices: DeviceSession[];
+  busy: boolean;
+  currentId: string | null;
+  onSignOut: (id: string) => void;
+  onDemote?: (id: string) => void;
+  onPromoteBlocked?: () => void;
+}) {
+  if (devices.length === 0) return null;
+  return (
+    <div className="mt-6" data-people-orphans="">
+      <div className="text-[13px] font-medium text-ink">{t("people.orphans.title")}</div>
+      <p className="mt-1 text-[12px] leading-relaxed text-ink-secondary">{t("people.orphans.hint")}</p>
+      <DeviceRows
+        sessions={devices}
+        busy={busy}
+        currentId={currentId}
+        onSignOut={onSignOut}
+        onDemote={onDemote}
+        onPromoteBlocked={onPromoteBlocked}
+      />
     </div>
   );
 }
@@ -152,7 +319,21 @@ export function CopyLink({ link }: { link: string }) {
   );
 }
 
-export function PortalPeople({ peopleUrl, people }: { peopleUrl: string | null; people: Person[] }) {
+export function PortalPeople({
+  peopleUrl,
+  people,
+  orphans,
+  busy,
+  currentId,
+  onSignOutDevice,
+}: {
+  peopleUrl: string | null;
+  people: Person[];
+  orphans: DeviceSession[];
+  busy: boolean;
+  currentId: string | null;
+  onSignOutDevice: (id: string) => void;
+}) {
   const noop = () => {};
   return (
     <Card title={t("people.title")} subtitle={t("people.portal.subtitle")}>
@@ -170,9 +351,38 @@ export function PortalPeople({ peopleUrl, people }: { peopleUrl: string | null; 
         )}
       </div>
       <div className="mt-4">
-        <PeopleTable people={people} busy={false} readOnly onRole={noop} onRemove={noop} onLink={noop} />
+        <PeopleTable people={people} busy={busy} readOnly onRole={noop} onRemove={noop} onLink={noop} onSignOutDevice={onSignOutDevice} currentId={currentId} />
       </div>
+      <OrphanDevices devices={orphans} busy={busy} currentId={currentId} onSignOut={onSignOutDevice} />
       <p className="mt-3 text-[12px] leading-relaxed text-ink-secondary">{t("people.portal.note")}</p>
+    </Card>
+  );
+}
+
+export function OidcPeople({
+  people,
+  orphans,
+  busy,
+  currentId,
+  onSignOutDevice,
+}: {
+  people: Person[];
+  orphans: DeviceSession[];
+  busy: boolean;
+  currentId: string | null;
+  onSignOutDevice: (id: string) => void;
+}) {
+  const noop = () => {};
+  return (
+    <Card title={t("people.title")} subtitle={t("people.oidc.subtitle")}>
+      <div data-people-oidc className="flex flex-col gap-3 text-[13px] leading-relaxed text-ink-secondary">
+        <p>{t("people.oidc.managed")}</p>
+      </div>
+      <div className="mt-4">
+        <PeopleTable people={people} busy={busy} readOnly onRole={noop} onRemove={noop} onLink={noop} onSignOutDevice={onSignOutDevice} currentId={currentId} />
+      </div>
+      <OrphanDevices devices={orphans} busy={busy} currentId={currentId} onSignOut={onSignOutDevice} />
+      <p className="mt-3 text-[12px] leading-relaxed text-ink-secondary">{t("people.oidc.note")}</p>
     </Card>
   );
 }
@@ -184,6 +394,8 @@ export function PeopleSection({ simple = false, startOpen = false }: { simple?: 
   const [membership, setMembership] = useState<Membership | null>(null);
   const [lists, setLists] = useState<SignInLists | null>(null);
   const [people, setPeople] = useState<Person[]>([]);
+  const [orphans, setOrphans] = useState<DeviceSession[]>([]);
+  const [currentId, setCurrentId] = useState<string | null>(null);
   const [base, setBase] = useState<string>(typeof window !== "undefined" ? window.location.origin : "");
   const [emailOffered, setEmailOffered] = useState<boolean | null>(null);
   const [draft, setDraft] = useState("");
@@ -199,7 +411,7 @@ export function PeopleSection({ simple = false, startOpen = false }: { simple?: 
     try {
       const [config, sessions, usage, domain, environment] = await Promise.all([
         api("/api/config"),
-        api("/api/auth/sessions").catch(() => ({ sessions: [] })),
+        api("/api/auth/sessions").catch(() => ({ sessions: [], current: null })),
         api("/api/usage?groupBy=user").catch(() => ({ groups: [] })),
         api("/api/settings/custom-domain").catch(() => null),
         fetch("/.well-known/openmausbot/environment").then((res) => (res.ok ? res.json() : null)).catch(() => null),
@@ -213,7 +425,10 @@ export function PeopleSection({ simple = false, startOpen = false }: { simple?: 
       setLists(current);
       const signedIn = Array.isArray(sessions?.sessions) ? sessions.sessions : [];
       const spent = Array.isArray(usage?.groups) ? usage.groups : [];
-      setPeople(authority.authority === "portal" ? peopleFromSessions(signedIn, spent) : mergePeople(current, signedIn, spent));
+      const devices = asDevices(signedIn);
+      setPeople(authority.authority === "portal" || authority.authority === "oidc" ? peopleFromSessions(signedIn, spent) : mergePeople(current, signedIn, spent));
+      setOrphans(orphanDevices(devices));
+      setCurrentId(typeof sessions?.current === "string" ? sessions.current : null);
       if (typeof domain?.publicUrl === "string" && domain.publicUrl) setBase(domain.publicUrl);
       setEmailOffered(environment?.capabilities?.emailSignIn === true ? true : environment ? false : null);
     } catch (cause) {
@@ -243,6 +458,19 @@ export function PeopleSection({ simple = false, startOpen = false }: { simple?: 
     }
   };
 
+  const run = async (work: () => Promise<void>) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await work();
+      await load();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const invite = async () => {
     setTried(true);
     if (!lists || busy) return;
@@ -256,11 +484,29 @@ export function PeopleSection({ simple = false, startOpen = false }: { simple?: 
     setLink(inviteLink(base, entry));
   };
 
+  const signOutDevice = (id: string) => void run(async () => {
+    await api(`/api/auth/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+  });
+  const signOutAll = (person: Person) => void run(async () => {
+    await api(`/api/auth/sessions?email=${encodeURIComponent(person.entry)}`, { method: "DELETE" });
+  });
+  const demoteDevice = (id: string) => void run(async () => {
+    await api(`/api/auth/sessions/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ scopes: ["client"] }) });
+  });
+
   if (!canPairDevices(session)) return null;
-  const portal = membership?.authority === "portal" ? <PortalPeople peopleUrl={membership.peopleUrl} people={people} /> : null;
+  const portal = membership?.authority === "portal"
+    ? <PortalPeople peopleUrl={membership.peopleUrl} people={people} orphans={orphans} busy={busy} currentId={currentId} onSignOutDevice={signOutDevice} />
+    : null;
+  const oidc = membership?.authority === "oidc"
+    ? <OidcPeople people={people} orphans={orphans} busy={busy} currentId={currentId} onSignOutDevice={signOutDevice} />
+    : null;
+  const managed = portal ?? oidc;
+  const signInNotice = membership?.remoteSignIn === "oidc" ? "people.oidcSignIn"
+    : membership?.pairingCodes === false ? "people.portalSignIn" : "people.notHosted";
   const content = (
     <>
-      {emailOffered === false && (!simple || tried) && <p className="mb-3 rounded-lg border border-warning/25 bg-warning/5 px-3 py-2 text-[13px] text-ink-secondary">{t(membership?.pairingCodes === false ? "people.portalSignIn" : "people.notHosted")}</p>}
+      {emailOffered === false && (!simple || tried) && <p className="mb-3 rounded-lg border border-warning/25 bg-warning/5 px-3 py-2 text-[13px] text-ink-secondary">{t(signInNotice)}</p>}
       <form className="flex flex-wrap items-center gap-2" onSubmit={(event) => { event.preventDefault(); void invite(); }}>
         <input
           value={draft}
@@ -286,11 +532,22 @@ export function PeopleSection({ simple = false, startOpen = false }: { simple?: 
         <PeopleTable
           people={people}
           busy={busy}
+          currentId={currentId}
           onRole={(person, next) => { if (lists) void save(withEntry(lists, person.entry, next)); }}
           onRemove={(person) => { if (lists) void save(withoutEntry(lists, person.entry)); }}
           onLink={(person) => setLink(inviteLink(base, person.entry))}
+          onSignOutAll={signOutAll}
+          onSignOutDevice={signOutDevice}
         />
       </div>
+      <OrphanDevices
+        devices={orphans}
+        busy={busy}
+        currentId={currentId}
+        onSignOut={signOutDevice}
+        onDemote={demoteDevice}
+        onPromoteBlocked={() => setError(t("people.promotePairing"))}
+      />
       {!simple && <p className="mt-3 text-[12px] leading-relaxed text-ink-secondary">{t("people.note")}</p>}
     </>
   );
@@ -308,9 +565,9 @@ export function PeopleSection({ simple = false, startOpen = false }: { simple?: 
             {open ? t("common.done") : t("settings.simple.people.invite")}
           </button>
         </div>
-        {open && <div className="px-3.5 pb-3.5 pt-1">{portal ?? content}</div>}
+        {open && <div className="px-3.5 pb-3.5 pt-1">{managed ?? content}</div>}
       </div>
     );
   }
-  return portal ?? <Card title={t("people.title")} subtitle={t("people.subtitle")}>{content}</Card>;
+  return managed ?? <Card title={t("people.title")} subtitle={t("people.subtitle")}>{content}</Card>;
 }

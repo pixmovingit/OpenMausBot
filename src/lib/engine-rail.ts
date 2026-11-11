@@ -50,3 +50,9 @@ export function splitEngineRail<T>(instances: readonly T[]): {
   }
   return { subscription, api, custom };
 }
+
+/** API keys and local engines first, then sign-in plans. */
+export function orderEnginesByAccess<T>(instances: readonly T[]): T[] {
+  const { subscription, api, custom } = splitEngineRail(instances);
+  return [...api, ...custom, ...subscription];
+}

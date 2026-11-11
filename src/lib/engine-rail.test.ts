@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { InstanceInfo } from "@/state/store";
-import { configuredModelInstances, modelsAwaitEngine, splitEngineRail } from "./engine-rail";
+import { configuredModelInstances, modelsAwaitEngine, orderEnginesByAccess, splitEngineRail } from "./engine-rail";
 
 describe("splitEngineRail", () => {
   it("groups sign-in plans, pasted provider keys and Local engines", () => {
@@ -20,6 +20,15 @@ describe("splitEngineRail", () => {
   it("hides the second group when nothing is custom-only", () => {
     const rows = [{ instanceId: "claude" }];
     expect(splitEngineRail(rows).custom).toEqual([]);
+  });
+
+  it("lists API keys and local engines ahead of sign-in plans", () => {
+    expect(orderEnginesByAccess([
+      { access: "subscription", instanceId: "claude" },
+      { access: "custom", instanceId: "hermes" },
+      { instanceId: "grok" },
+      { access: "api", instanceId: "mistral" },
+    ]).map((row) => row.instanceId)).toEqual(["mistral", "hermes", "claude", "grok"]);
   });
 });
 

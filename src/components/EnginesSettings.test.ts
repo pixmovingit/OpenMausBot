@@ -449,6 +449,15 @@ describe("Settings → AI in Simple mode", () => {
     expect(html).not.toContain("Model providers and accounts");
   });
 
+  it("lists API keys and local engines ahead of sign-in plans", () => {
+    fixture.instances = [
+      engine("claude", "claudeAgent", true),
+      engine("openaiCompat", "openai-compat", true, { access: "api", displayName: "Other (OpenAI-compatible)", cliDefault: undefined }),
+      engine("pi", "piAgent", true, { access: "custom" }),
+    ];
+    expect(rows(simple())).toEqual(["openaiCompat", "pi", "claude"]);
+  });
+
   it("folds every other provider under More AI providers, with the count", () => {
     fixture.instances = [engine("claude", "claudeAgent", true), engine("kimi", "kimiAgent", false), engine("mistral", "mistral", false)];
     expect(simple()).toMatch(/aria-expanded="false"[^>]*>[\s\S]*?More AI providers \(2\)/);

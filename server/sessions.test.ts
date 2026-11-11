@@ -741,6 +741,59 @@ describe("telling the server a session opened", () => {
   });
 });
 
+describe("local account management", () => {
+  it("revokeEmail ends every local email device for that address and leaves pairing and other addresses alone", () => {
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["admin", "client"] });
+    const paired = pair();
+    const first = registry.issue({ label: "browser", email: "person@example.test", scopes: ["admin", "client"] });
+    const second = registry.issue({ label: "phone", email: "person@example.test", scopes: ["client"] });
+    const other = registry.issue({ label: "other", email: "other@example.test", scopes: ["client"] });
+    const tickets = [first, second].map(({ session }) => registry.issueStreamTicket(session.id).ticket);
+    expect(registry.revokeEmail("Person@Example.test")).toBe(2);
+    expect(registry.authenticate(first.token)).toBeNull();
+    expect(registry.authenticate(second.token)).toBeNull();
+    expect(tickets.map((ticket) => registry.redeemStreamTicket(ticket))).toEqual([null, null]);
+    expect(registry.authenticate(paired.token)?.id).toBe(paired.session.id);
+    expect(registry.authenticate(other.token)?.id).toBe(other.session.id);
+    expect(registry.revokeEmail("")).toBe(0);
+  });
+
+  it("revokeEmail leaves portal, oidc and team sessions alone", () => {
+    registry = new SessionRegistry({
+      file: file(),
+      now: () => clock,
+      emailScopes: () => ["client"],
+      portalMembership: true,
+      oidcMembership: true,
+    });
+    const local = registry.issue({ label: "local", email: "person@example.test", scopes: ["client"] });
+    const portal = registry.issuePortal({ email: "person@example.test", grant: "g".repeat(43), scopes: ["client"] });
+    const oidc = registry.issueOidc({ email: "person@example.test", subject: "sub-1", scopes: ["client"] });
+    const { code } = registry.openPairing({ scopes: ["client"], member: { email: "person@example.test", role: "member" } });
+    const team = registry.exchange({ code, label: "team", source: "t" });
+    if (!team.ok) throw new Error(team.error);
+    expect(registry.revokeEmail("person@example.test")).toBe(1);
+    expect(registry.authenticate(local.token)).toBeNull();
+    expect(registry.authenticate(portal.token)?.id).toBe(portal.session.id);
+    expect(registry.authenticate(oidc.token)?.id).toBe(oidc.session.id);
+    expect(registry.authenticate(team.token)?.id).toBe(team.session.id);
+  });
+
+  it("demote narrows a local admin pairing to client and refuses foreign membership", () => {
+    const admin = pair();
+    const member = registry.issue({ label: "phone", scopes: ["client"] });
+    expect(registry.demote(admin.session.id)).toBe("ok");
+    expect(registry.authenticate(admin.token)?.scopes).toEqual(["client"]);
+    expect(registry.demote(admin.session.id)).toBe("already");
+    expect(registry.demote(member.session.id)).toBe("already");
+    expect(registry.demote("missing")).toBe("missing");
+    registry = new SessionRegistry({ file: file(), now: () => clock, portalMembership: true });
+    const portal = registry.issuePortal({ email: "person@example.test", grant: "g".repeat(43), scopes: ["admin", "client"] });
+    expect(registry.demote(portal.session.id)).toBe("foreign");
+    expect(registry.authenticate(portal.token)?.scopes).toEqual(["admin", "client"]);
+  });
+});
+
 describe("a member's own phone on a Team Cloud", () => {
   const ADA = { email: "ada@acme.test", role: "member" as const };
   const HOUR = 60 * 60_000;

@@ -4,6 +4,7 @@ import { Check, Loader2, RefreshCw, TriangleAlert } from "lucide-react";
 import { api, useStore, type InstanceInfo } from "@/state/store";
 import { EngineCard, EngineSections, RefreshEngines, engineReady } from "./EngineLibrary";
 import { cn } from "@/lib/cn";
+import { orderEnginesByAccess } from "@/lib/engine-rail";
 import { useMenuMotion } from "./MenuMotion";
 import { t } from "@/lib/i18n";
 import { ApiKeyEngineManage, EngineSetup, EngineUpdateNotice, EngineWarningNotice, isApiKeyEngine } from "./EngineSetup";
@@ -533,7 +534,7 @@ export function EnginesSettings({ simple = false, more }: { simple?: boolean; mo
     const group = accountGroupOf(instance);
     return group && groups.get(group)?.[0] === instance ? group : null;
   };
-  const rows = listed.filter((instance) => !accountGroupOf(instance) || groupOf(instance));
+  const rows = orderEnginesByAccess(listed.filter((instance) => !accountGroupOf(instance) || groupOf(instance)));
   // A hidden ordinary Claude instance takes its card, and the endpoint section inside it, away. A hosted
   // workspace lists every engine read-only and refuses instance changes, so there the section has no Add.
   const hostedWorkspace = rows.length > 0 && rows.every((instance) => instance.readOnly);

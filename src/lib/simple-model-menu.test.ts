@@ -135,15 +135,14 @@ describe("the Simple model menu", () => {
     expect(body(built)).toMatchObject({ toggle: null });
   });
 
-  it("lists every ready provider at once: the current one first, then sign-ins, API keys and local engines", () => {
+  it("lists the current plan first, then API keys and local engines, and leaves other sign-in plans out", () => {
     const built = menu([codex, openaiKey, pi, claude(), claudeKey]);
-    expect(built.groups.map((group) => group.label)).toEqual(["Claude", "OpenAI", "OpenAI · API key", "Claude · API key", "pi"]);
-    expect(rows(built, 1)).toEqual(["GPT-5.6", "GPT-5.6 mini", "GPT-5.5"]);
-    expect(rows(built, 3)).toEqual(["Sonnet 5", "Fable 5.1"]);
+    expect(built.groups.map((group) => group.label)).toEqual(["Claude", "OpenAI · API key", "Claude · API key", "pi"]);
+    expect(rows(built, 2)).toEqual(["Sonnet 5", "Fable 5.1"]);
   });
 
-  it("offers three suggestions in a provider that does not hold the current model", () => {
-    const built = menu([claude(), engine("other", "codex", "Codex", "subscription", claudeModels.slice(0, 5))]);
+  it("offers three suggestions in an API provider that does not hold the current model", () => {
+    const built = menu([claude(), engine("other", "openai-compat", "Other", "api", claudeModels.slice(0, 5))]);
     expect(rows(built, 1)).toHaveLength(3);
     expect(body(built, 1)).toMatchObject({ toggle: "more", total: 5 });
   });
@@ -152,27 +151,30 @@ describe("the Simple model menu", () => {
     expect(menu([cursor], { selection: { instanceId: "cursor", model: "auto" } }).groups).toEqual([]);
   });
 
-  it("names each signed-in account of one family, and keeps a signed-out sibling one click from signing in", () => {
+  it("names each signed-in account of one family, and hides a signed-out sibling until search", () => {
     const work = engine("claude-work", "claudeAgent", "Work", "subscription", claudeModels.slice(0, 2));
     const home = { ...engine("claude-home", "claudeAgent", "Home", "subscription", claudeModels.slice(0, 2)),
       snapshot: { state: "available" as const, authenticated: false } };
     const built = menu([claude(), work, home]);
     expect(built.groups.map((group) => [group.label, group.body.kind])).toEqual([
-      ["Claude", "models"], ["Claude · Work", "models"], ["Claude · Home", "signIn"],
+      ["Claude", "models"], ["Claude · Work", "models"],
     ]);
     expect(built.groups[1]).toMatchObject({ provider: "Claude", account: "Work" });
     expect(built.current!.meta).toBe("Claude");
+    expect(built.groups.some((group) => group.instance.instanceId === "claude-home")).toBe(false);
   });
 
-  it("says why a provider cannot run: set up, sign in, managed, or nothing listed yet", () => {
+  it("keeps a managed API key in the list, and only shows set up or sign in for the plan the bot is on", () => {
     const missing = { ...cursor, snapshot: { state: "unavailable" as const, reason: "not found" } };
     const signedOut = { ...codex, snapshot: { state: "available" as const, authenticated: false } };
     const managed = { ...openaiKey, policy: { organizationName: "Acme", reason: "Company models only." } };
     const plan = engine("chatgpt", "codex", "ChatGPT plan", "subscription", [], { snapshot: { state: "available", authenticated: true, chatgptPlan: true } });
-    const built = menu([claude(), missing, signedOut, managed, plan]);
-    expect(Object.fromEntries(built.groups.map((group) => [group.instance.instanceId, group.body]))).toMatchObject({
-      cursor: { kind: "setUp" }, codex: { kind: "signIn" }, openai: { kind: "policy", organization: "Acme" }, chatgpt: { kind: "empty", loading: false },
+    expect(Object.fromEntries(menu([claude(), missing, signedOut, managed, plan]).groups.map((group) => [group.instance.instanceId, group.body]))).toMatchObject({
+      openai: { kind: "policy", organization: "Acme" },
     });
+    expect(body(menu([missing], { selection: { instanceId: "cursor", model: "auto" } }))).toEqual({ kind: "setUp" });
+    expect(body(menu([signedOut], { selection: { instanceId: "codex", model: "gpt-5.6" } }))).toEqual({ kind: "signIn" });
+    expect(body(menu([plan], { selection: { instanceId: "chatgpt", model: "" } }))).toEqual({ kind: "empty", loading: false });
   });
 
   it("says a provider is loading its models while it lists them, and offers to check again once it lists none", () => {
@@ -220,12 +222,15 @@ describe("the Simple model menu", () => {
   });
 
   it("offers the bot's model to a thread on its own once, in the follow row, not again in its provider", () => {
-    const own = menu([claude(), codex], { bot: { name: "Pepper", selection: { instanceId: "codex", model: "gpt-5.6" }, follows: false } });
+    const keys = engine("openai", "openai-compat", "OpenAI", "api", [
+      { id: "gpt-5.6", label: "GPT-5.6" }, { id: "gpt-5.6-mini", label: "GPT-5.6 mini" }, { id: "gpt-5.5", label: "GPT-5.5" },
+    ]);
+    const own = menu([claude(), keys], { bot: { name: "Pepper", selection: { instanceId: "openai", model: "gpt-5.6" }, follows: false } });
     expect(own.follow).toBe(true);
     expect(rows(own, 1)).toEqual(["GPT-5.6 mini", "GPT-5.5"]);
     const onlyModel = menu([claude(), cursor], { bot: { name: "Pepper", selection: { instanceId: "cursor", model: "auto" }, follows: false } });
     expect(onlyModel.groups.map((group) => group.label)).toEqual(["Claude"]);
-    expect(rows(menu([claude(), codex], { bot: { name: "Pepper", selection: { instanceId: "codex", model: "gpt-5.6" } } }), 1))
+    expect(rows(menu([claude(), keys], { bot: { name: "Pepper", selection: { instanceId: "openai", model: "gpt-5.6" } } }), 1))
       .toEqual(["GPT-5.6", "GPT-5.6 mini", "GPT-5.5"]);
     const router = engine("router", "openai-compat", "OpenRouter", "api", [1, 2, 3, 4].map((index) => ({ id: `r-${index}`, label: `Router ${index}` })));
     const searched = menu([claude(), codex, router], { query: "gpt-5.6", bot: { name: "Pepper", selection: { instanceId: "codex", model: "gpt-5.6" }, follows: false } });

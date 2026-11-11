@@ -234,4 +234,33 @@ describe("adding people to a hosted workspace", () => {
     expect(carol.reply.body.session).toMatchObject({ email: "carol@acme.test", scopes: ["client"] });
     expect((await signIn("carol@acme.test.evil", "Impostor")).reply.status).toBe(403);
   });
+
+  it("lets an admin sign out every device for an address without removing them, and demote a paired device", async () => {
+    const bob = await signIn(BOB, "Bob device A");
+    expect(bob.reply.status).toBe(200);
+    const bobB = await signIn(BOB, "Bob device B");
+    expect(bobB.reply.status).toBe(200);
+    expect((await as(bob.cookie)("/api/auth/sessions?email=" + encodeURIComponent(BOB), { method: "DELETE" })).status).toBe(403);
+    const kicked = await ada(`/api/auth/sessions?email=${encodeURIComponent(BOB)}`, { method: "DELETE" });
+    expect(kicked.status).toBe(200);
+    expect(kicked.body.revoked).toBeGreaterThanOrEqual(2);
+    expect((await as(bob.cookie)("/api/bots")).status).toBe(401);
+    expect((await as(bobB.cookie)("/api/bots")).status).toBe(401);
+    expect((await ada("/api/config")).body.signIn.members).toEqual(["@acme.test"]);
+    const fresh = await signIn(BOB, "Bob again");
+    expect(fresh.reply.status).toBe(200);
+
+    const pairing = await ada("/api/auth/pairing", { method: "POST", body: { scopes: ["admin", "client"], label: "Spare laptop" } });
+    expect(pairing.status).toBe(200);
+    const exchanged = await remote("/api/auth/pair", { body: { code: pairing.body.code, label: "Spare laptop" } });
+    expect(exchanged.status).toBe(200);
+    const deviceId = exchanged.body.session.id as string;
+    expect((await as(fresh.cookie)(`/api/auth/sessions/${deviceId}`, { method: "PATCH", body: { scopes: ["client"] } })).status).toBe(403);
+    const demoted = await ada(`/api/auth/sessions/${deviceId}`, { method: "PATCH", body: { scopes: ["client"] } });
+    expect(demoted.status).toBe(200);
+    expect(demoted.body.scopes).toEqual(["client"]);
+    expect((await ada(`/api/auth/sessions/${deviceId}`, { method: "PATCH", body: { scopes: ["admin", "client"] } })).status).toBe(400);
+    const listed = await ada("/api/auth/sessions");
+    expect(listed.body.sessions.find((s: { id: string }) => s.id === deviceId)?.scopes).toEqual(["client"]);
+  });
 });

@@ -86,6 +86,8 @@ export interface SimpleMenuInput {
   refreshing?: string | null;
   /** Picking a model also changes the bot's own model, not just this conversation's. */
   updatesBotDefault?: boolean;
+  /** Keep every ready plan in the list (backup AIs). The model picker omits idle sign-in plans. */
+  showEveryPlan?: boolean;
 }
 
 export function providerName(instance: InstanceInfo): string {
@@ -168,7 +170,7 @@ export function simpleModelMenu(input: SimpleMenuInput): SimpleMenu {
   const search = total > SIMPLE_SEARCH_AFTER || listed.some((instance) => takesTypedModels(instance) && !instance.policy && !needsCli(instance));
   const query = search ? input.query.trim() : "";
   const { subscription, api, custom } = splitEngineRail(listed);
-  const ordered = [...subscription, ...api, ...custom];
+  const ordered = [...api, ...custom, ...subscription];
   const current = ordered.find((instance) => instance.instanceId === selection.instanceId);
 
   function groupBody(instance: InstanceInfo, provider: string): MenuGroupBody | null {
@@ -216,10 +218,17 @@ export function simpleModelMenu(input: SimpleMenuInput): SimpleMenu {
     };
   }
 
+  function inCollapsedList(instance: InstanceInfo, body: MenuGroupBody): boolean {
+    if (input.showEveryPlan || query) return true;
+    if (body.kind === "signIn" || body.kind === "setUp") return instance === current;
+    if (instance === current || instance.access === "api" || instance.access === "custom") return true;
+    return signInFamily(instance) !== undefined && signInFamily(instance) === signInFamily(current);
+  }
+
   const groups = (current ? [current, ...ordered.filter((instance) => instance !== current)] : ordered).flatMap((instance): MenuGroup[] => {
     const named = heading(instance, listed);
     const body = groupBody(instance, named.provider);
-    return body ? [{ instance, ...named, body }] : [];
+    return body && inCollapsedList(instance, body) ? [{ instance, ...named, body }] : [];
   });
 
   return {

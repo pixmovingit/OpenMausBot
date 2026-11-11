@@ -69,9 +69,9 @@ const sessionSchema = z.object({
   expiresAt: z.number(),
   userId: z.string().max(256).optional(),
   email: z.string().max(320).optional(),
-  /** `portal`: set only by the internal verified-portal issuance path. `team`: the Admin's signed member claim on a
-   * Team Cloud. Never by email or pairing input. */
-  membershipAuthority: z.enum(["portal", "team"]).optional(),
+  /** `portal`: verified hosted handoff. `oidc`: verified OIDC SSO. `team`: Admin-signed Team Cloud claim.
+   * Never by email or pairing input. */
+  membershipAuthority: z.enum(["portal", "team", "oidc"]).optional(),
   /** A Team Cloud session's role in the team, from the Admin's claim. */
   teamRole: z.enum(["owner", "admin", "member"]).optional(),
   /** A team session opened with a code its member made (their phone): when the Admin last vouched for that member. The
@@ -224,6 +224,8 @@ export interface SessionStoreOptions {
   emailScopes?: EmailScopesResolver;
   emailScopesSnapshot?: () => EmailScopesResolver;
   portalMembership?: boolean;
+  /** When true, OIDC sessions skip the local email allow-list (OMB_OIDC_MEMBERSHIP=oidc). */
+  oidcMembership?: boolean;
   /** Between membershipChanged() calls, the hot paths (each request, stream frame and liveness check) recheck email
    * membership at most this often. Default 0: every call. */
   recheckMs?: number;
@@ -577,7 +579,15 @@ export class SessionRegistry {
     return this.issueAccount({ label: "Hosted workspace", email: input.email, userId: `portal:${input.grant}`, scopes: input.scopes }, "portal");
   }
 
-  private issueAccount(input: { label: string; scopes: Scope[]; userId?: string; email?: string }, membershipAuthority?: "portal"): { token: string; session: PublicSession } {
+  /** Call only after a verified OIDC authorization-code exchange; no HTTP route accepts this marker as input. */
+  issueOidc(input: { email: string; subject: string; scopes: Scope[] }): { token: string; session: PublicSession } {
+    if (!input.email || !/^[^\s]{1,255}$/.test(input.subject) || input.subject.includes(":")) {
+      throw new Error("A verified OIDC identity is required");
+    }
+    return this.issueAccount({ label: "OIDC SSO", email: input.email, userId: `oidc:${input.subject}`, scopes: input.scopes }, "oidc");
+  }
+
+  private issueAccount(input: { label: string; scopes: Scope[]; userId?: string; email?: string }, membershipAuthority?: "portal" | "oidc"): { token: string; session: PublicSession } {
     this.refusePersonal(input.scopes);
     this.prune();
     const now = this.now();
@@ -629,8 +639,10 @@ export class SessionRegistry {
   revalidateEmailSessions(): void {
     if (this.closed) throw new Error("Session registry is closed.");
     this.membershipCheckedAt = this.now();
-    // A team session's membership is the Admin's signed claim, checked at each pairing (cloud-team.ts), never the sign-in list.
-    const eligible = this.sessions.filter(session => session.email !== undefined && session.membershipAuthority !== "team" && !(this.options.portalMembership && session.membershipAuthority === "portal"));
+    // Team / portal-authority / oidc-authority membership is checked elsewhere, never the sign-in list.
+    const eligible = this.sessions.filter(session => session.email !== undefined && session.membershipAuthority !== "team"
+      && !(this.options.portalMembership && session.membershipAuthority === "portal")
+      && !(this.options.oidcMembership && session.membershipAuthority === "oidc"));
     if (!eligible.length) return;
     let resolveScopes = this.options.emailScopes;
     try {
@@ -758,6 +770,33 @@ export class SessionRegistry {
     const ended = this.sessions.filter((session) => session.membershipAuthority === "team" && session.email?.toLowerCase() === address && (keepRole === undefined || session.teamRole !== keepRole));
     for (const session of ended) this.revoke(session.id);
     return ended.length;
+  }
+
+  /** Local email sign-ins only: every device for this address ends now. Portal, OIDC and Team Cloud sessions are left alone. */
+  revokeEmail(email: string): number {
+    const address = email.trim().toLowerCase();
+    if (!address) return 0;
+    const ended = this.sessions.filter((session) => this.localEmailSession(session) && session.email!.toLowerCase() === address);
+    for (const session of ended) this.revoke(session.id);
+    return ended.length;
+  }
+
+  /** Pairing (and other local) devices: drop admin without minting a wider credential. Portal, OIDC and Team stay untouched. */
+  demote(id: string): "ok" | "missing" | "already" | "foreign" {
+    const record = this.sessions.find((session) => session.id === id);
+    if (!record) return "missing";
+    if (record.membershipAuthority === "team" || record.membershipAuthority === "portal" || record.membershipAuthority === "oidc") return "foreign";
+    if (!record.scopes.includes("admin")) return "already";
+    record.scopes = ["client"];
+    this.persist();
+    return "ok";
+  }
+
+  private localEmailSession(session: SessionRecord): boolean {
+    return session.email !== undefined
+      && session.membershipAuthority !== "team"
+      && !(this.options.portalMembership && session.membershipAuthority === "portal")
+      && !(this.options.oidcMembership && session.membershipAuthority === "oidc");
   }
 
   revoke(id: string): boolean {

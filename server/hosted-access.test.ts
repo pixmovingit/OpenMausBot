@@ -432,7 +432,7 @@ describe("hosted bridge in the full server", () => {
     const config = (await call("/api/config", { cookie: admin })).body;
     expect(config.decisions).toEqual({ retentionDays: 365 });
     expect(config.budgets.monthlyUsd).toBeUndefined();
-    expect(config.membership).toEqual({ authority: "portal", pairingCodes: false, peopleUrl: "https://admin.example.test/people?workspace=acme" });
+    expect(config.membership).toEqual({ authority: "portal", pairingCodes: false, remoteSignIn: "portal", peopleUrl: "https://admin.example.test/people?workspace=acme" });
     policyEvidence.push({ loopbackTrust: "service", refused: refused.map(([method, path]) => `${method} ${path}`), membership: config.membership });
   }, 30_000);
 });

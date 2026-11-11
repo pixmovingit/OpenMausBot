@@ -117,6 +117,7 @@ function BackupChooser({ bot, current, exclude, onPick, label, title, buttonRef,
     const built = simpleModelMenu({
       instances: state.instances, listed, selection: current ?? NO_SELECTION,
       bot: { name: bot.name, selection: bot.modelSelection }, query, expanded, probing: NOTHING_PROBED, loading, refreshing,
+      showEveryPlan: true,
     });
     const groups = built.groups.map((group) => group.instance.instanceId === bot.modelSelection.instanceId
       ? { ...group, note: t("botPanel.backups.sameAccount") } : group);
