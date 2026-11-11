@@ -5,10 +5,10 @@ const SUBJECT = "MausBot introduced me: $50 Boat credit";
 const BODY = "Hi Boat team,\n\nMausBot introduced me to Boat. I'm on the $___ plan.\nMy Boat account email: ___\n\nThanks!";
 
 describe("Boat's credit offer", () => {
-  it("goes to boat.dev and claims at Boat's billing address, with no end date until Boat names one", () => {
+  it("goes to boat.dev and claims at Boat's billing address, and has ended", () => {
     expect(BOAT_OFFER.url).toBe("https://boat.dev");
     expect(BOAT_OFFER.claimTo).toBe("support@ascii.dev");
-    expect(BOAT_OFFER.until).toBeNull();
+    expect(BOAT_OFFER.until).toBe(Date.UTC(2026, 10, 11));
   });
 
   it("drafts the claim to that address with the subject and body Boat asked for, for the person to send", () => {
@@ -26,7 +26,8 @@ describe("Boat's credit offer", () => {
 
   it("runs until its end date, and for good while none is set", () => {
     const end = Date.UTC(2026, 11, 1);
-    expect(boatOfferRuns(end)).toBe(true);
+    expect(boatOfferRuns(Date.UTC(2026, 10, 11))).toBe(false);
+    expect(boatOfferRuns(end - 1, { ...BOAT_OFFER, until: null })).toBe(true);
     expect(boatOfferRuns(end - 1, { ...BOAT_OFFER, until: end })).toBe(true);
     expect(boatOfferRuns(end, { ...BOAT_OFFER, until: end })).toBe(false);
     expect(boatOfferRuns(end + 1, { ...BOAT_OFFER, until: end })).toBe(false);

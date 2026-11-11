@@ -281,6 +281,9 @@ describe("Boat's credit offer on the Boat card", () => {
   const offer = () => row("box")!.querySelector<HTMLElement>("[data-boat-offer]");
   const buttons = () => [...offer()!.querySelectorAll<HTMLButtonElement>("button")];
   const openComputers = () => flushSync(() => section("computers").querySelector<HTMLButtonElement>("button[aria-expanded]")!.click());
+  beforeEach(() => {
+    BOAT_OFFER.until = null;
+  });
   afterEach(() => {
     BOAT_OFFER.until = null;
     applyBrand({ brand: DEFAULT_BRAND, source: "default", file: "" });
